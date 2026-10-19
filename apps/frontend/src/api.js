@@ -1,10 +1,25 @@
 // Shared API client for the QuestBoard FastAPI backend.
 // The backend URL comes from VITE_API_BASE_URL (see .env.example).
+import {
+  demoCreateQuest,
+  demoJoinQuest,
+  demoListMyParticipations,
+  demoListMyQuests,
+  demoListPublishedQuests,
+  demoPublishQuest,
+  resetDemoQuests,
+} from "./demoQuests.js";
+
+export { resetDemoQuests };
+
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/+$/, "");
 
 // Form limits, matching the backend models in apps/backend/src/models/.
 export const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export const EMAIL_MAX_LENGTH = 255;
+// Any valid address works: the backend has no domain rule.
+export const EMAIL_HINT = "Use your school or personal email.";
+export const EMAIL_PLACEHOLDER = "you@example.com";
 export const NAME_MAX_LENGTH = 120;
 export const PASSWORD_MIN_LENGTH = 12;
 export const PASSWORD_MAX_LENGTH = 128;
@@ -17,6 +32,28 @@ export const ROLE_REQUEST_STATUSES = ["pending", "approved", "rejected"];
 export function roleRequestsEnabled() {
   return import.meta.env.VITE_ROLE_REQUESTS_ENABLED === "true";
 }
+
+// The backend has no complete quest API on main yet. Keep pages off until you turn them on.
+export function questsEnabled() {
+  return import.meta.env.VITE_QUESTS_ENABLED === "true";
+}
+
+// Sample-data mode for local demos. Only available in the Vite dev server, never in
+// production builds. When on, quest calls never hit the network.
+export function questsDemoEnabled() {
+  return import.meta.env.DEV === true && import.meta.env.VITE_QUESTS_DEMO === "true";
+}
+
+// Limits aligned with apps/backend models/catalogue.py on Chelsy's QB-50 branch.
+export const QUEST_TITLE_MAX_LENGTH = 200;
+export const QUEST_DESCRIPTION_MAX_LENGTH = 5000;
+export const QUEST_LOCATION_MAX_LENGTH = 255;
+export const QUEST_CATEGORY_MAX_LENGTH = 64;
+export const QUEST_PROOF_MAX_LENGTH = 5000;
+export const QUEST_POINTS_MIN = 1;
+export const QUEST_POINTS_MAX = 10000;
+export const QUEST_TIME_ZONE_MAX_LENGTH = 64;
+export const DEFAULT_QUEST_TIME_ZONE = "Europe/Paris";
 
 // Error thrown for every failed request.
 // `status` is 0 when the server could not be reached, so callers can tell a network
@@ -272,4 +309,131 @@ export async function reviewRoleRequest(requestId, decision, token) {
   }
   const path = `/role-requests/${encodeURIComponent(requestId)}/${decision}`;
   return readRoleRequest(await request(path, { method: "POST", token }));
+}
+
+// Reads a JSON:API quest / catalogue-item resource.
+// Chelsy's QB-50 create endpoint returns type "catalogue-items" with point_value and owner_id.
+function readQuest(resource) {
+  const attributes = resource.attributes || {};
+  if (typeof resource.id !== "string" || typeof attributes.title !== "string" || !attributes.status) {
+    throw new ApiError("The server returned an incomplete quest.", 200);
+  }
+  // Accept both the live catalogue type and a future "quests" type.
+  if (resource.type && resource.type !== "catalogue-items" && resource.type !== "quests") {
+    throw new ApiError("The server returned an unexpected quest type.", 200);
+  }
+  const points = attributes.point_value ?? attributes.points;
+  return {
+    id: resource.id,
+    title: attributes.title,
+    description: attributes.description || "",
+    location: attributes.location || "",
+    startsAt: attributes.starts_at || "",
+    endsAt: attributes.ends_at || "",
+    timeZone: attributes.time_zone || "",
+    category: attributes.category || "",
+    proofInstructions: attributes.proof_instructions || "",
+    points,
+    status: attributes.status,
+    organizerId: attributes.owner_id || attributes.organizer_id,
+  };
+}
+
+// Clear explanation when the backend has no quest route yet (typical on main today).
+export function questApiUnavailableMessage(error, action = "load quests") {
+  if (error && (error.status === 404 || error.status === 405 || error.isUnsupported)) {
+    return (
+      `This backend doesn't support that quest action yet, so QuestBoard couldn't ${action}. ` +
+      "POST /quests (create draft) may still work on Chelsy's QB-50 branch; list, publish, and join are separate. " +
+      "For a local UI demo of those missing routes, set VITE_QUESTS_DEMO=true in apps/frontend/.env (dev only) and restart Vite."
+    );
+  }
+  return error?.message || "Something went wrong.";
+}
+
+function readQuestList(data) {
+  if (!Array.isArray(data)) {
+    throw new ApiError("The server returned an unexpected quest list.", 200);
+  }
+  return data.map(readQuest);
+}
+
+// Reads a JSON:API "quest-participations" resource.
+function readParticipation(resource) {
+  const attributes = resource.attributes || {};
+  if (typeof resource.id !== "string" || attributes.quest_id == null) {
+    throw new ApiError("The server returned an incomplete quest participation.", 200);
+  }
+  return {
+    id: resource.id,
+    questId: String(attributes.quest_id),
+    status: attributes.status || "joined",
+    joinedAt: attributes.joined_at || "",
+  };
+}
+
+// Quest client: demo sample data in DEV when VITE_QUESTS_DEMO=true, otherwise the live API.
+export function getQuestClient(session) {
+  if (questsDemoEnabled()) {
+    return {
+      isDemo: true,
+      listPublishedQuests: () => demoListPublishedQuests(),
+      listMyQuests: () => demoListMyQuests(),
+      createQuest: (fields) => demoCreateQuest(fields),
+      publishQuest: (questId) => demoPublishQuest(questId),
+      joinQuest: (questId) => demoJoinQuest(questId, session.userId),
+      listMyParticipations: () => demoListMyParticipations(session.userId),
+      resetDemo: () => resetDemoQuests(),
+    };
+  }
+
+  return {
+    isDemo: false,
+    listPublishedQuests: () => listPublishedQuests(session.token),
+    listMyQuests: () => listMyQuests(session.token),
+    createQuest: (fields) => createQuest(fields, session.token),
+    publishQuest: (questId) => publishQuest(questId, session.token),
+    joinQuest: (questId) => joinQuest(questId, session.token),
+    listMyParticipations: () => listMyParticipations(session.token),
+    resetDemo: async () => {},
+  };
+}
+
+// POST /quests (organizers) -> the new quest, saved as a draft.
+// Body matches QuestCreate on QB-50: point_value, time_zone, timezone-aware ISO times.
+export async function createQuest(fields, token) {
+  const resource = await request("/quests", { method: "POST", body: fields, token });
+  return readQuest(resource);
+}
+
+// GET /quests/mine (organizers) -> the signed-in organizer's own quests, drafts included.
+// Not on main or QB-50 yet; proposed for the frontend demo contract.
+export async function listMyQuests(token) {
+  return readQuestList(await request("/quests/mine", { token }));
+}
+
+// POST /quests/{id}/publish (the quest's organizer) -> the published quest.
+export async function publishQuest(questId, token) {
+  const path = `/quests/${encodeURIComponent(questId)}/publish`;
+  return readQuest(await request(path, { method: "POST", token }));
+}
+
+// GET /quests -> published quests.
+export async function listPublishedQuests(token) {
+  return readQuestList(await request("/quests", { token }));
+}
+
+// POST /quests/{id}/join (students) -> the new participation.
+export async function joinQuest(questId, token) {
+  const path = `/quests/${encodeURIComponent(questId)}/join`;
+  return readParticipation(await request(path, { method: "POST", token }));
+}
+
+// GET /quest-participations/me -> the quests the signed-in user has joined.
+export async function listMyParticipations(token) {
+  const data = await request("/quest-participations/me", { token });
+  if (!Array.isArray(data)) {
+    throw new ApiError("The server returned an unexpected participation list.", 200);
+  }
+  return data.map(readParticipation);
 }

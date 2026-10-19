@@ -4,30 +4,59 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
   getCurrentUser,
+  listMyQuests,
+  listMyParticipations,
   listMyRoleRequests,
+  listPublishedQuests,
   listRoleRequests,
   login,
+  questsEnabled,
   roleRequestsEnabled,
 } from "./api.js";
 import App from "./App.jsx";
 
 vi.mock("./api.js", async (importOriginal) => {
   const actual = await importOriginal();
+  const listMyQuests = vi.fn();
+  const listMyParticipations = vi.fn();
+  const listPublishedQuests = vi.fn();
   return {
     ...actual,
     getCurrentUser: vi.fn(),
+    listMyQuests,
+    listMyParticipations,
     listMyRoleRequests: vi.fn(),
+    listPublishedQuests,
     listRoleRequests: vi.fn(),
     login: vi.fn(),
+    questsEnabled: vi.fn(),
+    questsDemoEnabled: vi.fn(() => false),
     registerUser: vi.fn(),
     roleRequestsEnabled: vi.fn(),
     updateUser: vi.fn(),
+    resetDemoQuests: vi.fn(),
+    getQuestClient: () => ({
+      isDemo: false,
+      listMyQuests: () => listMyQuests("tok"),
+      listMyParticipations: () => listMyParticipations("tok"),
+      listPublishedQuests: () => listPublishedQuests("tok"),
+      createQuest: vi.fn(),
+      publishQuest: vi.fn(),
+      joinQuest: vi.fn(),
+      resetDemo: vi.fn(),
+    }),
   };
 });
 
 const SESSION_KEY = "questboard.session";
 const USER = { id: "7", name: "Ada", email: "ada@aup.edu", roles: ["student"] };
 const ADMIN = { id: "1", name: "Root", email: "root@aup.edu", roles: ["student", "admin"] };
+const ORGANIZER = {
+  id: "4",
+  name: "Omar",
+  email: "omar@aup.edu",
+  roles: ["student", "organizer"],
+};
 
 function storeSession(overrides = {}) {
   const session = {
@@ -40,12 +69,25 @@ function storeSession(overrides = {}) {
   return session;
 }
 
+async function openAccountMenu(user, label = /Account$/) {
+  await user.click(screen.getByRole("button", { name: label }));
+}
+
+async function chooseAccountMenuItem(user, name) {
+  await openAccountMenu(user);
+  await user.click(screen.getByRole("menuitem", { name }));
+}
+
 beforeEach(() => {
   vi.resetAllMocks();
   sessionStorage.clear();
   getCurrentUser.mockResolvedValue(USER);
+  questsEnabled.mockReturnValue(false);
   roleRequestsEnabled.mockReturnValue(false);
+  listMyQuests.mockResolvedValue([]);
+  listMyParticipations.mockResolvedValue([]);
   listMyRoleRequests.mockResolvedValue([]);
+  listPublishedQuests.mockResolvedValue([]);
   listRoleRequests.mockResolvedValue([]);
 });
 
@@ -93,7 +135,7 @@ describe("Loading the profile (QB-47)", () => {
 
     expect(await screen.findByText(/the server doesn't support it yet/)).toBeInTheDocument();
     expect(screen.queryByText(/Stale/)).not.toBeInTheDocument();
-    expect(screen.getByLabelText("New name")).toHaveValue("");
+    expect(screen.getByLabelText("New email")).toHaveValue("");
   });
 });
 
@@ -141,7 +183,7 @@ describe("Session handling (QB-45, interim sessionStorage)", () => {
     render(<App />);
 
     await screen.findByLabelText("Name");
-    await user.click(screen.getByRole("button", { name: "Log out" }));
+    await chooseAccountMenuItem(user, "Log out");
 
     expect(screen.getByText("You have been logged out.")).toBeInTheDocument();
     expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
@@ -170,7 +212,7 @@ describe("Session handling (QB-45, interim sessionStorage)", () => {
     storeSession();
     render(<App />);
     await screen.findByLabelText("Name");
-    await user.click(screen.getByRole("button", { name: "Log out" }));
+    await chooseAccountMenuItem(user, "Log out");
 
     login.mockResolvedValue({
       token: "tok-2",
@@ -199,7 +241,7 @@ describe("Refreshing the account page", () => {
 
     expect(await screen.findByText("Roles: Student")).toBeInTheDocument();
     expect(await screen.findByText("Pending approval")).toBeInTheDocument();
-    await user.type(screen.getByLabelText("Name"), " (unsaved)");
+    await user.type(screen.getByLabelText("Email"), ".unsaved");
 
     // An admin approved the request in the meantime.
     getCurrentUser.mockResolvedValue({ ...USER, roles: ["student", "organizer"] });
@@ -211,7 +253,7 @@ describe("Refreshing the account page", () => {
     expect(await screen.findByText("Roles: Student, Organizer")).toBeInTheDocument();
     expect(await screen.findByText("Approved")).toBeInTheDocument();
     expect(screen.getByLabelText("Role")).toHaveDisplayValue("Moderator");
-    expect(screen.getByLabelText("Name")).toHaveValue("Ada (unsaved)");
+    expect(screen.getByLabelText("Email")).toHaveValue("ada@aup.edu.unsaved");
     expect(sessionStorage.getItem(SESSION_KEY)).not.toBeNull();
     expect(getCurrentUser).toHaveBeenCalledTimes(2);
   });
@@ -222,12 +264,16 @@ describe("Refreshing the account page", () => {
     storeSession();
     render(<App />);
     await screen.findByText("Roles: Student");
-    expect(screen.queryByRole("navigation", { name: "Pages" })).not.toBeInTheDocument();
+    await openAccountMenu(user);
+    expect(screen.queryByRole("menuitem", { name: "Role requests" })).not.toBeInTheDocument();
+    await user.keyboard("{Escape}");
 
     getCurrentUser.mockResolvedValue({ ...USER, roles: ["student", "admin"] });
     await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await screen.findByText(/Roles:\s*Student,\s*Admin/i);
 
-    expect(await screen.findByRole("button", { name: "Role requests" })).toBeInTheDocument();
+    await openAccountMenu(user);
+    expect(await screen.findByRole("menuitem", { name: "Role requests" })).toBeInTheDocument();
   });
 });
 
@@ -239,49 +285,122 @@ describe("Admin navigation (no Jira key yet)", () => {
     storeSession({ userId: "1" });
     render(<App />);
 
-    const adminTab = await screen.findByRole("button", { name: "Role requests" });
-    expect(screen.getByRole("button", { name: "Your account" })).toHaveAttribute(
-      "aria-current",
-      "page"
-    );
-
-    await user.click(adminTab);
+    await screen.findByLabelText("Name");
+    await chooseAccountMenuItem(user, "Role requests");
 
     expect(screen.getByRole("heading", { name: "Role requests" })).toBeInTheDocument();
     expect(listRoleRequests).toHaveBeenCalledWith("pending", "tok");
-    expect(adminTab).toHaveAttribute("aria-current", "page");
     expect(await screen.findByText("No pending requests.")).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Your account" }));
+    await chooseAccountMenuItem(user, "Account settings");
     expect(screen.getByLabelText("Name")).toHaveValue("Root");
   });
 
   it("does not show the admin entry to non-admins", async () => {
+    const user = userEvent.setup();
     roleRequestsEnabled.mockReturnValue(true);
     storeSession();
     render(<App />);
 
     await screen.findByLabelText("Name");
-    expect(screen.queryByRole("button", { name: "Role requests" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("navigation")).not.toBeInTheDocument();
+    await openAccountMenu(user);
+    expect(screen.queryByRole("menuitem", { name: "Role requests" })).not.toBeInTheDocument();
+    expect(screen.getByRole("navigation", { name: "Pages" })).toBeInTheDocument();
     expect(listRoleRequests).not.toHaveBeenCalled();
   });
 
   it("does not show the admin entry when role requests are disabled", async () => {
+    const user = userEvent.setup();
     getCurrentUser.mockResolvedValue(ADMIN);
     storeSession({ userId: "1" });
     render(<App />);
 
     await screen.findByLabelText("Name");
-    expect(screen.queryByRole("button", { name: "Role requests" })).not.toBeInTheDocument();
+    await openAccountMenu(user);
+    expect(screen.queryByRole("menuitem", { name: "Role requests" })).not.toBeInTheDocument();
   });
 
-  it("does not show the admin entry before the profile has loaded", () => {
+  it("does not show the admin entry before the profile has loaded", async () => {
+    const user = userEvent.setup();
     roleRequestsEnabled.mockReturnValue(true);
     getCurrentUser.mockReturnValue(new Promise(() => {}));
     storeSession({ userId: "1" });
     render(<App />);
 
-    expect(screen.queryByRole("button", { name: "Role requests" })).not.toBeInTheDocument();
+    await openAccountMenu(user);
+    expect(screen.getByRole("menuitem", { name: "Account settings" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Role requests" })).not.toBeInTheDocument();
+  });
+});
+
+describe("Quest navigation (QB-58, QB-60, QB-90)", () => {
+  it("hides quest pages when the feature is off", async () => {
+    storeSession();
+    render(<App />);
+
+    await screen.findByLabelText("Name");
+    expect(screen.queryByRole("button", { name: "Quests" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "My quests" })).not.toBeInTheDocument();
+    expect(listPublishedQuests).not.toHaveBeenCalled();
+    expect(listMyQuests).not.toHaveBeenCalled();
+  });
+
+  it("lands students on Quests after login when the feature is on", async () => {
+    questsEnabled.mockReturnValue(true);
+    listPublishedQuests.mockResolvedValue([
+      {
+        id: "11",
+        title: "Campus cleanup",
+        description: "",
+        location: "Quai d'Orsay",
+        startsAt: "2026-10-20T12:00:00Z",
+        endsAt: "2026-10-20T14:00:00Z",
+        category: "Volunteering",
+        proofInstructions: "",
+        points: 50,
+        status: "published",
+        organizerId: "4",
+      },
+    ]);
+    storeSession();
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "Quests" })).toHaveAttribute(
+      "aria-current",
+      "page"
+    );
+    expect(screen.queryByRole("button", { name: "My quests" })).not.toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", { name: "View quest: Campus cleanup" })
+    ).toBeInTheDocument();
+    expect(listPublishedQuests).toHaveBeenCalledWith("tok");
+    expect(listMyParticipations).toHaveBeenCalledWith("tok");
+    expect(listMyQuests).not.toHaveBeenCalled();
+  });
+
+  it("keeps account settings available from the account menu", async () => {
+    const user = userEvent.setup();
+    questsEnabled.mockReturnValue(true);
+    storeSession();
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "What's your next campus adventure?" });
+    await chooseAccountMenuItem(user, "Account settings");
+    expect(screen.getByLabelText("Name")).toHaveValue("Ada");
+  });
+
+  it("lets an organizer open My quests and Create quest", async () => {
+    const user = userEvent.setup();
+    questsEnabled.mockReturnValue(true);
+    getCurrentUser.mockResolvedValue(ORGANIZER);
+    storeSession({ userId: "4" });
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "Create quest" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "My quests" }));
+
+    expect(await screen.findByRole("heading", { name: "Create a quest" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Title")).toBeInTheDocument();
+    expect(listMyQuests).toHaveBeenCalledWith("tok");
   });
 });

@@ -1,11 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
+  createQuest,
   createRoleRequest,
   formErrorsFrom,
   getCurrentUser,
+  joinQuest,
+  listMyParticipations,
+  listMyQuests,
   listMyRoleRequests,
+  listPublishedQuests,
   listRoleRequests,
+  publishQuest,
+  questApiUnavailableMessage,
+  questsDemoEnabled,
+  questsEnabled,
   registerUser,
   reviewRoleRequest,
   roleRequestsEnabled,
@@ -262,5 +271,141 @@ describe("api client", () => {
       "email",
     ]);
     expect(extra).toEqual({ fieldErrors: {}, formError: "Roles: Extra inputs" });
+  });
+});
+
+describe("quest client (proposed contract, QB-58/60/90)", () => {
+  const questAttributes = {
+    title: "Campus cleanup",
+    description: "Pick up litter.",
+    location: "Quai d'Orsay",
+    starts_at: "2026-10-20T12:00:00Z",
+    ends_at: "2026-10-20T14:00:00Z",
+    time_zone: "Europe/Paris",
+    category: "Volunteering",
+    proof_instructions: "Photo of your bag.",
+    point_value: 50,
+    status: "draft",
+    owner_id: "4",
+  };
+  const questResource = {
+    type: "catalogue-items",
+    id: "11",
+    attributes: { ...questAttributes, kind: "quest" },
+  };
+  const parsedQuest = {
+    id: "11",
+    title: "Campus cleanup",
+    description: "Pick up litter.",
+    location: "Quai d'Orsay",
+    startsAt: "2026-10-20T12:00:00Z",
+    endsAt: "2026-10-20T14:00:00Z",
+    timeZone: "Europe/Paris",
+    category: "Volunteering",
+    proofInstructions: "Photo of your bag.",
+    points: 50,
+    status: "draft",
+    organizerId: "4",
+  };
+
+  it("is off unless VITE_QUESTS_ENABLED is true", () => {
+    vi.stubEnv("VITE_QUESTS_ENABLED", "");
+    expect(questsEnabled()).toBe(false);
+    vi.stubEnv("VITE_QUESTS_ENABLED", "false");
+    expect(questsEnabled()).toBe(false);
+    vi.stubEnv("VITE_QUESTS_ENABLED", "true");
+    expect(questsEnabled()).toBe(true);
+  });
+
+  it("keeps demo mode off unless DEV and VITE_QUESTS_DEMO are both on", () => {
+    vi.stubEnv("VITE_QUESTS_DEMO", "true");
+    // Vitest runs with DEV=true; assert the flag is still required.
+    expect(questsDemoEnabled()).toBe(true);
+    vi.stubEnv("VITE_QUESTS_DEMO", "false");
+    expect(questsDemoEnabled()).toBe(false);
+  });
+
+  it("explains a missing quest API instead of a generic 404", () => {
+    expect(questApiUnavailableMessage(new ApiError("Not Found", 404), "load quests")).toMatch(
+      /doesn't support that quest action/i
+    );
+    expect(questApiUnavailableMessage(new ApiError("down", 0), "load quests")).toBe("down");
+  });
+
+  it("creates a quest with POST /quests and the QB-50 field names", async () => {
+    const fetchMock = stubFetch(jsonResponse(201, { data: questResource }));
+    const { status, owner_id, kind, ...fields } = questAttributes;
+
+    const quest = await createQuest(fields, "tok");
+
+    expect(quest).toEqual(parsedQuest);
+    const [url, options] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://api.test/quests");
+    expect(options.method).toBe("POST");
+    expect(options.headers.Authorization).toBe("Bearer tok");
+    expect(JSON.parse(options.body)).toEqual(fields);
+  });
+
+  it("lists the organizer's own quests from GET /quests/mine", async () => {
+    const fetchMock = stubFetch(jsonResponse(200, { data: [questResource] }));
+
+    expect(await listMyQuests("tok")).toEqual([parsedQuest]);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://api.test/quests/mine");
+    expect(fetchMock.mock.calls[0][1].method).toBe("GET");
+  });
+
+  it("publishes with POST /quests/{id}/publish and no body", async () => {
+    const published = { ...questResource, attributes: { ...questAttributes, status: "published" } };
+    const fetchMock = stubFetch(jsonResponse(200, { data: published }));
+
+    expect((await publishQuest("11", "tok")).status).toBe("published");
+    expect(fetchMock.mock.calls[0][0]).toBe("http://api.test/quests/11/publish");
+    expect(fetchMock.mock.calls[0][1].method).toBe("POST");
+    expect(fetchMock.mock.calls[0][1].body).toBeUndefined();
+  });
+
+  it("lists published quests from GET /quests", async () => {
+    const fetchMock = stubFetch(jsonResponse(200, { data: [questResource] }));
+
+    expect(await listPublishedQuests("tok")).toHaveLength(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("http://api.test/quests");
+  });
+
+  it("joins with POST /quests/{id}/join and reads the participation", async () => {
+    const fetchMock = stubFetch(
+      jsonResponse(201, {
+        data: {
+          type: "quest-participations",
+          id: "3",
+          attributes: { quest_id: 11, status: "joined", joined_at: "2026-10-14T10:00:00Z" },
+        },
+      })
+    );
+
+    expect(await joinQuest("11", "tok")).toEqual({
+      id: "3",
+      questId: "11",
+      status: "joined",
+      joinedAt: "2026-10-14T10:00:00Z",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe("http://api.test/quests/11/join");
+    expect(fetchMock.mock.calls[0][1].method).toBe("POST");
+  });
+
+  it("lists participations from GET /quest-participations/me", async () => {
+    const fetchMock = stubFetch(
+      jsonResponse(200, {
+        data: [{ type: "quest-participations", id: "3", attributes: { quest_id: "11" } }],
+      })
+    );
+
+    expect((await listMyParticipations("tok"))[0].questId).toBe("11");
+    expect(fetchMock.mock.calls[0][0]).toBe("http://api.test/quest-participations/me");
+  });
+
+  it("rejects incomplete quest responses", async () => {
+    stubFetch(jsonResponse(200, { data: [{ type: "quests", id: "11", attributes: {} }] }));
+
+    await expect(listMyQuests("tok")).rejects.toThrow("incomplete quest");
   });
 });
