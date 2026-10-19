@@ -2,6 +2,10 @@
 // Do not use the browser's local timezone for the conversion.
 
 const WALL_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/;
+// Wide enough for any civil offset, and fine enough for 30-minute transitions
+// (Australia/Lord_Howe) as well as one-hour DST shifts.
+const OFFSET_SAMPLE_WINDOW_MS = 36 * 60 * 60 * 1000;
+const OFFSET_SAMPLE_STEP_MS = 15 * 60 * 1000;
 
 export function isValidTimeZone(timeZone) {
   if (!timeZone || typeof timeZone !== "string") return false;
@@ -11,10 +15,6 @@ export function isValidTimeZone(timeZone) {
   } catch {
     return false;
   }
-}
-
-function pad(n) {
-  return String(n).padStart(2, "0");
 }
 
 function formatWallInZone(date, timeZone) {
@@ -54,6 +54,35 @@ function offsetMsAt(instant, timeZone) {
   return asUtc - instant.getTime();
 }
 
+function matchingInstants(wall, timeZone) {
+  const [, ys, ms, ds, hs, mins] = WALL_PATTERN.exec(wall);
+  const asUtc = Date.UTC(Number(ys), Number(ms) - 1, Number(ds), Number(hs), Number(mins), 0);
+
+  // Collect every distinct zone offset that appears around this local day, then
+  // try each as an interpretation of the wall clock. That finds alternatives on
+  // either side of a transition and works for 30-minute as well as 60-minute shifts.
+  const offsets = new Set();
+  for (
+    let sample = asUtc - OFFSET_SAMPLE_WINDOW_MS;
+    sample <= asUtc + OFFSET_SAMPLE_WINDOW_MS;
+    sample += OFFSET_SAMPLE_STEP_MS
+  ) {
+    offsets.add(offsetMsAt(new Date(sample), timeZone));
+  }
+
+  const matches = [];
+  const seen = new Set();
+  for (const offset of offsets) {
+    const candidate = asUtc - offset;
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    if (formatWallInZone(new Date(candidate), timeZone) === wall) {
+      matches.push(candidate);
+    }
+  }
+  return matches.sort((a, b) => a - b);
+}
+
 // Returns { iso } or { error: "invalid" | "unknown_zone" | "impossible" | "ambiguous" }.
 export function wallTimeToIso(wall, timeZone) {
   if (!WALL_PATTERN.test(wall || "")) {
@@ -63,34 +92,14 @@ export function wallTimeToIso(wall, timeZone) {
     return { error: "unknown_zone" };
   }
 
-  const [, ys, ms, ds, hs, mins] = WALL_PATTERN.exec(wall);
-  const year = Number(ys);
-  const month = Number(ms);
-  const day = Number(ds);
-  const hour = Number(hs);
-  const minute = Number(mins);
-
-  // First guess: treat the wall clock as UTC, then subtract the zone offset.
-  let guess = Date.UTC(year, month - 1, day, hour, minute, 0);
-  const offset1 = offsetMsAt(new Date(guess), timeZone);
-  guess = Date.UTC(year, month - 1, day, hour, minute, 0) - offset1;
-  const offset2 = offsetMsAt(new Date(guess), timeZone);
-  if (offset1 !== offset2) {
-    guess = Date.UTC(year, month - 1, day, hour, minute, 0) - offset2;
-  }
-
-  const primary = new Date(guess);
-  if (formatWallInZone(primary, timeZone) !== wall) {
+  const matches = matchingInstants(wall, timeZone);
+  if (matches.length === 0) {
     return { error: "impossible" };
   }
-
-  // Fall-back ambiguity: another UTC instant one hour earlier may show the same wall time.
-  const earlier = new Date(guess - 60 * 60 * 1000);
-  if (formatWallInZone(earlier, timeZone) === wall && earlier.getTime() !== primary.getTime()) {
+  if (matches.length > 1) {
     return { error: "ambiguous" };
   }
-
-  return { iso: primary.toISOString() };
+  return { iso: new Date(matches[0]).toISOString() };
 }
 
 export function describeWallTimeError(error, label = "time") {
